@@ -18,6 +18,7 @@ import albumentations.pytorch as AP
 from PIL import Image
 from io import BytesIO
 from packaging import version
+import time
 
 filepath = os.path.abspath(__file__)
 repopath = os.path.split(filepath)[0]
@@ -27,26 +28,24 @@ from transparent_background.InSPyReNet import InSPyReNet_SwinB
 from transparent_background.utils import *
 
 class Remover:
+
     def __init__(self, mode="base", jit=False, device=None, ckpt=None, resize='static'):
-        """
-        Args:
-            mode   (str): Choose among below options
-                                   base -> slow & large gpu memory required, high quality results
-                                   fast -> resize input into small size for fast computation
-                                   base-nightly -> nightly release for base mode
-            jit    (bool): use TorchScript for fast computation
-            device (str, optional): specifying device for computation. find available GPU resource if not specified.
-            ckpt   (str, optional): specifying model checkpoint. find downloaded checkpoint or try download if not specified.
-            fast   (bool, optional, DEPRECATED): replaced by mode argument. use fast mode if True.
-        """
+        t0 = time.time()
+
         cfg_path = os.environ.get('TRANSPARENT_BACKGROUND_FILE_PATH', os.path.abspath(os.path.expanduser('~')))
         home_dir = os.path.join(cfg_path, ".transparent-background")
         os.makedirs(home_dir, exist_ok=True)
 
         if not os.path.isfile(os.path.join(home_dir, "config.yaml")):
             shutil.copy(os.path.join(repopath, "config.yaml"), os.path.join(home_dir, "config.yaml"))
-        self.meta = load_config(os.path.join(home_dir, "config.yaml"))[mode]
+        print("Time to prepare config: {:.2f}s".format(time.time() - t0))
+        t1 = time.time()
 
+        self.meta = load_config(os.path.join(home_dir, "config.yaml"))[mode]
+        print("Time to load config: {:.2f}s".format(time.time() - t1))
+        t2 = time.time()
+
+        # Device detection
         if device is not None:
             self.device = device
         else:
@@ -58,7 +57,10 @@ class Remover:
                 and torch.backends.mps.is_available()
             ):
                 self.device = "mps:0"
+        print("Time to determine device: {:.2f}s".format(time.time() - t2))
+        t3 = time.time()
 
+        # Checkpoint download
         download = False
         if ckpt is None:
             ckpt_dir = home_dir
@@ -76,6 +78,7 @@ class Remover:
                     download = True
 
             if download:
+                print("Downloading checkpoint...")
                 if 'drive.google.com' in self.meta.url:
                     gdown.download(self.meta.url, os.path.join(ckpt_dir, ckpt_name), fuzzy=True, proxy=self.meta.http_proxy)
                 elif 'github.com' in self.meta.url:
@@ -84,7 +87,10 @@ class Remover:
                     raise NotImplementedError('Please use valid URL')
         else:
             ckpt_dir, ckpt_name = os.path.split(os.path.abspath(ckpt))
+        print("Time to handle checkpoint: {:.2f}s".format(time.time() - t3))
+        t4 = time.time()
 
+        # Model load
         self.model = InSPyReNet_SwinB(depth=64, pretrained=False, threshold=None, **self.meta)
         self.model.eval()
         self.model.load_state_dict(
@@ -92,6 +98,8 @@ class Remover:
             strict=True,
         )
         self.model = self.model.to(self.device)
+        print("Time to load and move model to device: {:.2f}s".format(time.time() - t4))
+        t5 = time.time()
 
         if jit:
             ckpt_name = self.meta.ckpt_name.replace(
@@ -112,10 +120,10 @@ class Remover:
                 del self.model
                 self.model = traced_model
                 torch.jit.save(self.model, os.path.join(ckpt_dir, ckpt_name))
-            if resize != 'static':
-                warnings.warn('Resizing method for TorchScript mode only supports static resize. Fallback to static.')
-                resize = 'static'
+        print("Time for TorchScript handling: {:.2f}s".format(time.time() - t5))
+        t6 = time.time()
 
+        # Resizing & transforms
         resize_tf = None
         resize_fn = None
         if resize == 'static':
@@ -123,34 +131,34 @@ class Remover:
             resize_fn = A.Resize(*self.meta.base_size)
         elif resize == 'dynamic':
             if 'base' not in mode:
-                warnings.warn('Dynamic resizing only supports base and base-nightly mode. It will cause severe performance degradation with fast mode.')
+                warnings.warn('Dynamic resizing only supports base and base-nightly mode.')
             resize_tf = dynamic_resize(L=1280)
             resize_fn = dynamic_resize_a(L=1280)
         else:
             raise AttributeError(f'Unsupported resizing method {resize}')
+        print("Time to prepare resize functions: {:.2f}s".format(time.time() - t6))
+        t7 = time.time()
 
-        self.transform = transforms.Compose(
-            [
-                resize_tf,
-                tonumpy(),
-                normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                totensor(),
-            ]
-        )
+        self.transform = transforms.Compose([
+            resize_tf,
+            tonumpy(),
+            normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            totensor(),
+        ])
 
-        self.cv2_transform = A.Compose(
-            [
-                resize_fn,
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                AP.ToTensorV2(),
-            ]
-        )
+        self.cv2_transform = A.Compose([
+            resize_fn,
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            AP.ToTensorV2(),
+        ])
+        print("Time to create transforms: {:.2f}s".format(time.time() - t7))
+        t8 = time.time()
 
         self.background = {'img': None, 'name': None, 'shape': None}
         desc = "Mode={}, Device={}, Torchscript={}".format(
             mode, self.device, "enabled" if jit else "disabled"
         )
-        
+
         estimate_foreground_ml = None
         try:
             from pymatting.foreground.estimate_foreground_ml_cupy import estimate_foreground_ml_cupy as estimate_foreground_ml
@@ -162,10 +170,11 @@ class Remover:
                     from pymatting import estimate_foreground_ml
                 except ImportError:
                     warnings.warn('Failed to load pymatting. Ignore this message if post-processing is not needed')
-                
         self.matting_fn = estimate_foreground_ml
-        
+        print("Time to set up pymatting: {:.2f}s".format(time.time() - t8))
+
         print("Settings -> {}".format(desc))
+
 
     def process(self, img, type="rgba", threshold=None, reverse=False):
         """
