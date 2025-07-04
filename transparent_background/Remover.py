@@ -158,21 +158,6 @@ class Remover:
         desc = "Mode={}, Device={}, Torchscript={}".format(
             mode, self.device, "enabled" if jit else "disabled"
         )
-
-        estimate_foreground_ml = None
-        try:
-            from pymatting.foreground.estimate_foreground_ml_cupy import estimate_foreground_ml_cupy as estimate_foreground_ml
-        except ImportError:
-            try:
-                from pymatting.foreground.estimate_foreground_ml_pyopencl import estimate_foreground_ml_pyopencl as estimate_foreground_ml
-            except ImportError:
-                try:
-                    from pymatting import estimate_foreground_ml
-                except ImportError:
-                    warnings.warn('Failed to load pymatting. Ignore this message if post-processing is not needed')
-        self.matting_fn = estimate_foreground_ml
-        print("Time to set up pymatting: {:.2f}s".format(time.time() - t8))
-
         print("Settings -> {}".format(desc))
 
 
@@ -227,11 +212,6 @@ class Remover:
             img = (np.stack([pred] * 3, axis=-1) * 255).astype(np.uint8)
 
         elif type == "rgba":
-            if threshold is None and self.matting_fn is not None:
-                img = self.matting_fn(img / 255.0, pred)
-                img = 255 * np.clip(img, 0., 1.) + 0.5
-                img = img.astype(np.uint8)
-
             r, g, b = cv2.split(img)
             pred = (pred * 255).astype(np.uint8)
             img = cv2.merge([r, g, b, pred])
